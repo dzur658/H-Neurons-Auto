@@ -9,14 +9,20 @@ from tqdm import tqdm
 from openai import OpenAI
 from transformers import AutoTokenizer
 
+# import modernbert qna model
+from auto.modernbert_qna import QnAModel
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Extract answer tokens from consistent responses.")
     parser.add_argument("--input_path", type=str, required=True, help="Path to samples files")
     parser.add_argument("--output_path", type=str, default="data/answer_tokens.jsonl", help="Path to save processed results")
     parser.add_argument("--tokenizer_path", type=str, default="data/activations", help="Path to the target model tokenizer")
     
+    # add QnA BERT model judge option
+    parser.add_argument("--judge_type", type=str, choices=["llm", "modernbert"], default="llm", help="How to judge correctness for token extraction")
+
     # LLM Extractor Config
-    parser.add_argument("--api_key", type=str, required=True, help="OpenAI API Key")
+    parser.add_argument("--api_key", type=str, help="OpenAI API Key")
     parser.add_argument("--base_url", type=str, default="https://api.openai.com/v1", help="API Base URL")
     parser.add_argument("--llm_model", type=str, default="gpt-4o", help="LLM for extraction")
     
@@ -50,14 +56,39 @@ class AnswerTokenExtractor:
     def __init__(self, args):
         self.args = args
         self.tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path, trust_remote_code=True)
-        self.client = OpenAI(api_key=args.api_key, base_url=args.base_url)
+
+        # Initialize OpenAI client if needed
+        if self.args.judge_type == "llm":
+            self.client = OpenAI(api_key=args.api_key, base_url=args.base_url)
+
+        # initialze modernbert qna model if needed
+        if self.args.judge_type == "modernbert":
+            self.qna_model = QnAModel("rankyx/ModernBERT-QnA-base-squad")
 
     def get_tokenized_list(self, text: str) -> List[str]:
-        token_ids = self.tokenizer.encode(text, add_special_tokens=False)
-        tokens = [self.tokenizer.decode([tid]) for tid in token_ids]
+        # token_ids = self.tokenizer.encode(text, add_special_tokens=False)
+        # tokens = [self.tokenizer.decode([tid]) for tid in token_ids]
+        tokens = self.tokenizer.tokenize(text, add_special_tokens=False)
 
         return tokens
-    
+
+    def char_span_to_token_span(self, text: str, char_start: int, char_end: int) -> Optional[List[str]]:
+        """Convert character span to token span using tokenizer offsets."""
+        encoding = self.tokenizer(text, return_offsets_mapping=True, add_special_tokens=False)
+
+        answer_tokens = []
+        for idx, (start, end) in enumerate(encoding["offset_mapping"]):
+            if end > char_start and start < char_end:
+                # append decoded tokens
+                # answer_tokens.append(self.tokenizer.decode([encoding["input_ids"][idx]]))
+
+                tid = encoding["input_ids"][idx]
+                raw_token = self.tokenizer.convert_ids_to_tokens(tid)
+                answer_tokens.append(raw_token)
+
+        print(f"Answer Tokens: {answer_tokens}")
+        return answer_tokens
+
     def extract_via_llm(self, question: str, response: str, tokens: List[str]) -> Optional[List[str]]:
         """Request LLM to select tokens from the tokenized list."""
         prompt = USER_INPUT_TEMPLATE.format(
@@ -83,6 +114,19 @@ class AnswerTokenExtractor:
                 print(f"Extraction failed (attempt {attempt+1}): {e}")
                 time.sleep(1)
         return None
+    
+    def modernbert_processing(self, question: str, response: str, tokens: List[str]) -> Optional[List[str]]:
+        """Use ModernBERT-QnA to extract answer tokens."""
+        qna_result = self.qna_model.predict(question, response)
+        
+        char_start = qna_result["start"]
+        char_end = qna_result["end"]
+
+        extracted_tokens = self.char_span_to_token_span(response, char_start, char_end)
+
+        if all(t in tokens for t in extracted_tokens):
+            return extracted_tokens
+        return None
 
     def load_processed_ids(self) -> Set[str]:
         """Resume from existing output file."""
@@ -96,9 +140,12 @@ class AnswerTokenExtractor:
 
     def run(self):
         processed_ids = self.load_processed_ids()
+
+        # test
+        # counter = 0
         
         with open(self.args.input_path, "r", encoding="utf-8") as f_in, \
-             open(self.args.output_path, "a", encoding="utf-8") as f_out:
+            open(self.args.output_path, "a", encoding="utf-8") as f_out:
             
             for line in tqdm(f_in, desc="Processing tokens"):
                 data = json.loads(line)
@@ -119,8 +166,12 @@ class AnswerTokenExtractor:
                 # Tokenization
                 tokenized_list = self.get_tokenized_list(rep_response)
 
-                # LLM Extraction
-                answer_tokens = self.extract_via_llm(content["question"], rep_response, tokenized_list)
+                if self.args.judge_type == "llm":
+                    # LLM Extraction
+                    answer_tokens = self.extract_via_llm(content["question"], rep_response, tokenized_list)
+                else:
+                    # ModernBERT-QnA Extraction
+                    answer_tokens = self.modernbert_processing(content["question"], rep_response, tokenized_list)
 
                 if answer_tokens:
                     result = {
@@ -134,6 +185,11 @@ class AnswerTokenExtractor:
                     }
                     f_out.write(json.dumps(result, ensure_ascii=False) + "\n")
                     f_out.flush()
+
+                # testing
+                # counter += 1
+                # if counter >= 100:
+                #     break
 
 if __name__ == "__main__":
     args = parse_args()

@@ -7,7 +7,7 @@ class QnAModel:
         self.model = ModernBertForQuestionAnswering.from_pretrained(model_name).cuda()
         self.qa_pipeline = pipeline("question-answering", model=self.model, tokenizer=self.tokenizer)
 
-    def predict(self, question: str, context: str) -> str:
+    def predict(self, question: str, context: str) -> dict:
         result = self.qa_pipeline(question=question, context=context)
 
         # return full result
