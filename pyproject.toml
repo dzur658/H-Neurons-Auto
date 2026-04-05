@@ -1,15 +1,36 @@
 [project]
 name = "h-neurons-auto"
 version = "0.1.0"
-description = "Add your description here"
+description = "DGX Spark Optimized Project"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = "==3.12.3"
 dependencies = [
     "accelerate>=1.13.0",
     "datasets>=4.8.4",
     "joblib>=1.5.3",
     "openai>=2.30.0",
+    "pyflakes>=3.4.0",
     "scikit-learn>=1.8.0",
     "transformers>=4.57.6",
+    "torch",
+    "torchvision",
+    "torchaudio",
     "vllm>=0.19.0",
 ]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true  # This prevents uv from searching here for non-torch packages
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+torchvision = { index = "pytorch-cu130" }
+torchaudio = { index = "pytorch-cu130" }
+# Note: vLLM usually needs its own nightly index for Blackwell
+vllm = { index = "vllm-nightly" }
+
+[[tool.uv.index]]
+name = "vllm-nightly"
+url = "https://wheels.vllm.ai/nightly/cu130"
+explicit = true

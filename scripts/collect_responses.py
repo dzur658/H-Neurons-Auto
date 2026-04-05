@@ -4,13 +4,16 @@ import re
 import string
 import argparse
 import time
-from typing import List, Set, Dict
+from typing import List, Set
 
 import torch
 from tqdm import tqdm
 from datasets import load_dataset
 from vllm import LLM, SamplingParams
 from openai import OpenAI  # 用于 LLM Judge
+
+# local checking
+from auto.modernbert_nli import NLIModel  # NLI model detects hallucinations locally with ~85% accuracy, on subsets of TriviaQA
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Consistency Filtering with Rule or LLM Judge.")
@@ -22,8 +25,9 @@ def parse_args():
     parser.add_argument("--max_samples", type=int, default=None, help="Maximum number of questions to process")
     parser.add_argument("--gpu_util", type=float, default=0.7, help="vLLM GPU memory utilization")
     parser.add_argument("--tp_size", type=int, default=None, help="Tensor parallel size")
+    parser.add_argument("--attn_backend", type=str, default="FLASH_ATTN", help="Attention backend for vLLM")
 
-    parser.add_argument("--judge_type", type=str, choices=["rule", "llm"], default="rule", help="How to judge correctness")
+    parser.add_argument("--judge_type", type=str, choices=["rule", "llm", "modernbert"], default="rule", help="How to judge correctness")
     parser.add_argument("--api_key", type=str, default=None, help="API key for LLM Judge")
     parser.add_argument("--base_url", type=str, default="https://api.openai.com/v1", help="API base URL")
     parser.add_argument("--judge_model", type=str, default="gpt-4o", help="Model name for LLM Judge")
@@ -70,9 +74,11 @@ class ConsistencySampler:
             model=args.model_path,
             tensor_parallel_size=self.tp_size,
             gpu_memory_utilization=args.gpu_util,
-            trust_remote_code=True
+            trust_remote_code=True,
+            attention_config={"backend": args.attn_backend}
         )
 
+        # H-Neurons paper reccomends these exact sampling params for consistency across models
         self.sampling_params = SamplingParams(
             temperature=1.0, top_p=0.9, top_k=50, max_tokens=50
         )
@@ -83,6 +89,11 @@ class ConsistencySampler:
             if not args.api_key:
                 raise ValueError("API Key is required for LLM Judge.")
             self.judge_client = OpenAI(api_key=args.api_key, base_url=args.base_url)
+        
+        # Init local NLI judge
+        self.nli_model = None
+        if args.judge_type == "modernbert":
+            self.nli_model = NLIModel("tasksource/ModernBERT-base-nli")
 
     def rule_judge(self, response: str, norm_gts: List[str]) -> str:
         """Simple string matching judge."""
@@ -118,6 +129,15 @@ class ConsistencySampler:
                 time.sleep(1)
         return "error"
 
+    def modernbert_judge(self, response: str, value: str) -> int:
+        """Use local NLI model with normalized class keys across checkpoints."""
+        result = self.nli_model.predict(response, value)
+        return {
+            "entailment": 1,
+            "contradiction": 0,
+            "neutral": -1
+        }.get(result.get("judge_key", "unknown"), -1)
+
     def process_data(self):
         dataset = load_dataset("parquet", data_files=self.args.data_path, split="train")
         if self.args.max_samples:
@@ -126,6 +146,9 @@ class ConsistencySampler:
         
         all_correct_count = 0
         all_incorrect_count = 0
+        
+        # only used for modernbert NLI judge to track neutral cases
+        all_neutral_count = 0
 
         with open(self.args.output_path, 'a', encoding='utf-8') as f:
             for item in tqdm(dataset, desc=f"Sampling ({self.args.judge_type} judge)"):
@@ -140,6 +163,17 @@ class ConsistencySampler:
                 for col in ['aliases', 'normalized_aliases']:
                     val = item['answer'].get(col)
                     if val: raw_aliases.extend(val) if isinstance(val, list) else raw_aliases.append(str(val))
+                
+                # for NLI model we use the value key of the TriviaQA dataset
+                try:
+                    value = item['answer'].get('value')
+
+                    # check for none value
+                    if value is None:
+                        raise KeyError("Value key is None")
+                except KeyError:
+                    # fallback to grabbing the first alias if value key is missing
+                    value = raw_aliases[0] if raw_aliases else ""
                 
                 norm_gts = [normalize_answer(a) for a in set(raw_aliases) if a]
                 if not norm_gts: continue
@@ -168,6 +202,15 @@ class ConsistencySampler:
                         # 2. Correctness check
                         if self.args.judge_type == "rule":
                             judges.append(self.rule_judge(ans, norm_gts))
+                        elif self.args.judge_type == "modernbert":
+                            judge_result = self.modernbert_judge(ans, value)
+                            if judge_result == 1:
+                                judges.append("true")
+                            elif judge_result == 0:
+                                judges.append("false")
+                            else:
+                                judges.append("neutral")
+                                all_neutral_count += 1
                         else:
                             # Use cache to save tokens if model repeats the same answer
                             if ans not in judge_cache:
@@ -191,13 +234,14 @@ class ConsistencySampler:
                         "question": f"{question.strip()} {suffix}",
                         "responses": responses,
                         "judges": judges,
-                        "ground_truth": list(set(raw_aliases))
+                        "ground_truth": list(set(raw_aliases)),
+                        "value": value
                     }
                 }
                 f.write(json.dumps(result, ensure_ascii=False) + '\n')
                 
                 if len(processed_qids) % 10 == 0:
-                    tqdm.write(f"Stats -> All-Correct: {all_correct_count}, All-Incorrect: {all_incorrect_count}")
+                    tqdm.write(f"Stats -> All-Correct: {all_correct_count}, All-Incorrect: {all_incorrect_count}, All-Neutral: {all_neutral_count}")
 
 if __name__ == "__main__":
     args = parse_args()

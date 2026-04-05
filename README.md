@@ -42,7 +42,9 @@ pip install -r requirements.txt
 Ensure your environment is set up and you have access to a target model (e.g., Llama-3, Mistral).
 
 ### 1. Collect Responses
-Sample responses from TriviaQA to construct train/test set. You can choose between `rule` or `llm` judging.
+Sample responses from TriviaQA to construct train/test set. You can choose between `rule`, `llm`, or `modernbert` judging.
+
+When using `--judge_type modernbert`, NLI label mapping is derived dynamically from the loaded model's `id2label/label2id` configuration. If the predicted class label cannot be mapped to `entailment`, `contradiction`, or `neutral`, the run fails fast with detailed mapping diagnostics.
 
 *   **For Training**: We perform multiple samplings (default 10) per question. We only retain questions that are **consistently correct** or **consistently hallucinated** across all samples.
 *   **For Evaluation**: We perform only **1 sampling** per question to evaluate the classifier's performance in a standard, real-world inference scenario.
