@@ -86,7 +86,7 @@ class AnswerTokenExtractor:
                 raw_token = self.tokenizer.convert_ids_to_tokens(tid)
                 answer_tokens.append(raw_token)
 
-        print(f"Answer Tokens: {answer_tokens}")
+        # print(f"Answer Tokens: {answer_tokens}")
         return answer_tokens
 
     def extract_via_llm(self, question: str, response: str, tokens: List[str]) -> Optional[List[str]]:
