@@ -1,0 +1,5 @@
+# Ignore specific subdirectories regardless of whether they are in train or val
+*/all_except_answer_tokens/
+*/answer_tokens/
+*/input/
+*/output/
