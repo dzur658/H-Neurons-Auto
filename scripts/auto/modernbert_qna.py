@@ -2,7 +2,7 @@ from transformers.models.modernbert.modular_modernbert import ModernBertForQuest
 from transformers import AutoTokenizer, pipeline
 
 class QnAModel:
-    def __init__(self, model_name: str):
+    def __init__(self, model_name: str = "rankyx/ModernBERT-QnA-base-squad"):
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model = ModernBertForQuestionAnswering.from_pretrained(model_name).cuda()
         self.qa_pipeline = pipeline("question-answering", model=self.model, tokenizer=self.tokenizer)
