@@ -16,6 +16,16 @@ dependencies = [
     "torchvision",
     "torchaudio",
     "vllm>=0.19.0",
+    "streamlit>=1.56.0",
+    "requests>=2.33.1",
+    "psutil>=7.2.2",
+]
+
+# if you would like to use CUDA libraries to accelerate logistic regression, you can install the following optional dependencies:
+[project.optional-dependencies]
+cuda = [
+    "cuml-cu13",
+    "cupy-cuda13x",
 ]
 
 [[tool.uv.index]]
@@ -34,3 +44,7 @@ vllm = { index = "vllm-nightly" }
 name = "vllm-nightly"
 url = "https://wheels.vllm.ai/nightly/cu130"
 explicit = true
+
+[[tool.uv.index]]
+name = "nvidia"
+url = "https://pypi.nvidia.com"
