@@ -12,7 +12,10 @@ import argparse
 from typing import List, Optional, Dict, Any, Union, Literal
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+
+import numpy as np
 
 from vllm import LLM, SamplingParams
 from transformers import AutoTokenizer
@@ -21,6 +24,20 @@ from transformers import AutoTokenizer
 from scripts.auto.modernbert_qna import QnAModel
 
 app = FastAPI(title="H-Neuron CETT Server")
+
+# CORS Origins (adjust accordingly if hitting CORS errors)
+origins = [
+    "http://localhost",
+    "http://localhost:8090",
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 engine: Optional[LLM] = None
 cett_manager = None
@@ -194,6 +211,20 @@ def parse_tool_call(output_text: str, tools: Optional[List[Dict[str, Any]]], too
         arguments=str(args_payload).replace("'", '"')
     )
 
+@app.get("/v1/models")
+async def list_models():
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": "gemma3-4b-it", # Make sure this matches what your POST route expects!
+                "object": "model",
+                "created": int(time.time()),
+                "owned_by": "cett-harness"
+            }
+        ]
+    }
+
 # ==========================================
 # 2. The Core Synchronous Route
 # ==========================================
@@ -279,7 +310,23 @@ def create_response(request: ResponsesRequest) -> JSONResponse:
                 # Flatten into 1D array for Scikit-Learn
                 flat_act = final_act.flatten().unsqueeze(0).cpu().float().numpy()
                 
+                # 1. Get the indices of the ~40 active H-Neurons
+                coefs = classifier.coef_[0]
+                active_indices = np.where(coefs != 0)[0]
+
+                # 2. Extract the raw magnitudes of JUST those 40 neurons from the current prompt
+                active_magnitudes = flat_act[0][active_indices]
+
+                # 3. Print the mean and max activation of the H-circuit
+                print(f"\n--- H-Neuron Circuit Diagnostics ---")
+                print(f"Mean Activation {len(active_indices)}: {np.mean(active_magnitudes):.4f}")
+                print(f"Max Activation {len(active_indices)}:  {np.max(active_magnitudes):.4f}")
+                print(f"SVM Decision Function Value:  {classifier.decision_function(flat_act)[0]:.4f}")
+                print("------------------------------------\n")
+
                 predictions = classifier.predict(flat_act)
+                print(f"predictions: {predictions}, score: {span_result['score']}")
+
                 is_hallucinating = 1 in predictions
 
         # Memory Cleanup
@@ -325,11 +372,17 @@ def create_response(request: ResponsesRequest) -> JSONResponse:
                 },
             })
         else:
-            messages.append({"role": "assistant", "content": output_text})
-            messages.append({
-                "role": "user", 
-                "content": f"[SYSTEM MESSAGE] Your previous response contained a hallucinated answer. The text specifically flagged as your answer, and the hallucination was: {span_result['answer'] if span_result else 'None'}. Helpful assistants are honest when they don't know an answer."
-            })
+            sys_warning = "[SYSTEM MESSAGE] Your previous response contained a hallucinated answer. The text specifically flagged as your answer, and the hallucination was: {span_result['answer'] if span_result else 'None'}. Helpful assistants are honest when they don't know an answer."
+
+            # messages.append({"role": "assistant", "content": output_text})
+            # messages.append({
+            #     "role": "user", 
+            #     "content": sys_warning
+            # })
+
+            messages.append({"role": "assistant", "content": span_result['answer'] if span_result else "None"})
+            messages.append({"role": "user", "content": sys_warning})
+
             print(f"Hallucination detected in response! Retrying generation (attempt {attempts+1}/{max_retries})...")
             attempts += 1
 
