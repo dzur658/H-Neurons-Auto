@@ -276,7 +276,7 @@ def create_response(request: ResponsesRequest) -> JSONResponse:
 
         is_hallucinating = False
 
-        if span_result and span_result['score'] > 0.1:
+        if span_result:
             char_start, char_end = span_result["start"], span_result["end"]
             encoding = model_tokenizer(output_text, return_offsets_mapping=True, add_special_tokens=False)
             
@@ -288,8 +288,9 @@ def create_response(request: ResponsesRequest) -> JSONResponse:
                 
                 # Apply prompt offset
                 prompt_len_offset = len(prompt_token_ids)
-                start_idx = target_indices[0] + prompt_len_offset
-                end_idx = target_indices[-1] + 1 + prompt_len_offset
+                # -1 to capture the decision token
+                start_idx = target_indices[0] + prompt_len_offset - 1
+                end_idx = target_indices[-1] + prompt_len_offset
 
                 # Clamp indices
                 max_len = cett_tensor.shape[1]
