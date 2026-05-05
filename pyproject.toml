@@ -19,6 +19,7 @@ dependencies = [
     "streamlit>=1.56.0",
     "requests>=2.33.1",
     "psutil>=7.2.2",
+    "ipykernel>=7.2.0",
 ]
 
 # if you would like to use CUDA libraries to accelerate logistic regression, you can install the following optional dependencies:
