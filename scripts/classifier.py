@@ -6,7 +6,7 @@ import numpy as np
 from tqdm import tqdm
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support, roc_auc_score
-from sklearn.model_selection import cross_validate
+from sklearn.model_selection import cross_validate, StratifiedKFold
 from transformers import AutoConfig
 
 import psutil
@@ -168,126 +168,145 @@ def get_total_neurons(model_path):
     else:
         raise ValueError("Unable to determine total neurons from model config. Please ensure the model has an 'intermediate_size' attribute in its config or text_config.")
 
-def evaluate_model(model, test_x, test_y):
-    preds = model.predict(test_x)
-
-    test_accuracy = accuracy_score(test_y, preds)
-    return test_accuracy
-
 def perform_c_constrained_search(X_train, y_train, args, sparsity_limit=0.01):
-    # we need to know how many total neurons are in the network
-    # we assume that the number of neurons should not exceed 0.1% of total neurons in the model, as the H-neurons paper suggests
     total_neurons = get_total_neurons(args.model_path)
 
-    # calcualte ideal n_jobs
+    if args.solver == "qn" and GPU_AVAILABLE:
+        model = perform_owlqn_constrained_search(X_train, y_train, args, total_neurons, sparsity_limit)
+        return model
+
     if args.solver == "liblinear":
         n_jobs_dynamic = calculate_dynamic_n_jobs(X_train, overhead_multiplier=20.0)
     elif args.solver == "saga":
         n_jobs_dynamic = calculate_dynamic_n_jobs(X_train, overhead_multiplier=1.5)
-    elif args.solver == "qn" and GPU_AVAILABLE:
-        # seperate module for CUDA-accelerated OWL-QN grid search
-
-        model = perform_owlqn_constrained_search(X_train, y_train, args, total_neurons, sparsity_limit)
-        return model
     else:
         raise ValueError(f"Unsupported solver for dynamic n_jobs calculation: {args.solver}")
 
-    # Suppress convergence warnings for cleaner output
-    warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
+    # ignore all warnings from sklearn
+    warnings.filterwarnings("ignore", module="sklearn")
 
-    # 1. Define the physical constraint
+    previous_accuracy = 0.5
+    previous_roi = float('inf')
+    previous_neuron_count = 0
+    consecutive_dips = 0
+
+    MIN_ACCEPTABLE_ROI = 0.001
+    MIN_CIRCUIT_SIZE = 5
+    MAX_SEARCH_STEPS = 80
+
     max_allowed_neurons = int(total_neurons * sparsity_limit)
     print(f"Architecture Limit: {max_allowed_neurons} neurons max ({sparsity_limit*100}% of {total_neurons})")
     print(f"Using n_jobs={n_jobs_dynamic} for parallel CPU cross-validation.")
 
-    print("Splitting data into CV set and hold out set...")
-    x_cv, X_test, y_cv, y_test = train_test_split(
-        X_train,
-        y_train,
-        test_size=0.2,
-        random_state=42,
-        stratify=y_train
-    )
-    
-    # 2. The Logarithmic Generator
-    def c_generator(start=0.001, step_multiplier=1.5):
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+
+    def c_generator(start=0.01, step_multiplier=1.15):
         current = start
         while True:
             yield current
             current *= step_multiplier
 
-    best_score = 0.0
+    best_score = float('-inf')
     best_c = None
     best_neuron_count = 0
 
     print("-" * 60)
-    print(f"{'C-Value':<10} | {'CV Accuracy':<15} | {'Active Neurons':<15} | {'Status':<10} | {'Accuracy on Hold-Out Set':<20}")
+    print(f"{'C-Value':<10} | {'CV Accuracy':<15} | {'Active Neurons':<15} | {'Status':<20}")
     print("-" * 60)
 
-    for c in c_generator():
+    for _, c in zip(range(MAX_SEARCH_STEPS), c_generator()):
         test_model = LogisticRegression(
-            penalty=args.penalty, 
-            solver=args.solver, 
-            C=c, 
-            class_weight="balanced", 
-            max_iter=1000, 
+            penalty=args.penalty,
+            solver=args.solver,
+            C=c,
+            class_weight="balanced",
+            max_iter=10000,
             random_state=42
         )
 
-        # 3. Parallel Execution
-        # return_estimator=True lets us inspect the models in memory without retraining
         cv_results = cross_validate(
-            test_model, 
-            X_cv, 
-            y_cv, 
-            cv=5, 
-            scoring='accuracy', 
-            n_jobs=n_jobs_dynamic,  # Spreads the 5 folds across your CPU cores
+            test_model,
+            X_train,
+            y_train,
+            cv=skf,
+            scoring='accuracy',
+            n_jobs=n_jobs_dynamic,
             return_estimator=True
         )
 
+        # FIX: SAGA does not ROI at 5 neurons and fails even with 5 turn grace period
         avg_score_train = sum(cv_results['test_score']) / len(cv_results['test_score'])
-        avg_score_test = evaluate_model(test_model, X_test, y_test)
-        
-        # 4. Check Sparsity across the folds
-        fold_sparsities = [np.sum(est.coef_ != 0) for est in cv_results['estimator']]
-        active_neurons = int(np.mean(fold_sparsities))
 
-        # 5. The Architecture Constraint Check
+        fold_sparsities = [int(np.sum(est.coef_ != 0)) for est in cv_results['estimator']]
+        active_neurons = max(fold_sparsities)
+
         if active_neurons > max_allowed_neurons:
             print(f"{c:<10.4f} | {avg_score_train:<15.4f} | {active_neurons:<15} | ❌ VIOLATION (Breaking Loop)")
-            break # Hit the physical limit. Stop computing immediately.
+            break
 
-        status = "✅ Valid"
+        delta_acc = avg_score_train - previous_accuracy
+        delta_neurons = active_neurons - previous_neuron_count
+
+        if delta_neurons > 0:
+            current_roi = delta_acc / delta_neurons
+        elif delta_neurons == 0 and delta_acc > 0:
+            current_roi = float('inf')
+        else:
+            current_roi = 0
+
+        if current_roi < MIN_ACCEPTABLE_ROI and active_neurons >= MIN_CIRCUIT_SIZE:
+            consecutive_dips += 1
+            status = f"⚠️  ROI Dip {consecutive_dips}/5"
+        else:
+            consecutive_dips = 0
+            status = "✅ Rising/Stable"
+
         if active_neurons == 0:
-            status = "⚠️ Dead (0 neurons)"
+            status = "⚠️  Dead (0 neurons)"
 
-        print(f"{c:<10.4f} | {avg_score_train:<15.4f} | {active_neurons:<15} | {status} | {avg_score_test:<20.4f}")
+        print(f"{c:<10.4f} | {avg_score_train:<15.4f} | {active_neurons:<15} | {status:<20}")
 
-        # Track the best valid model
-        if avg_score_test > best_score and active_neurons > 0:
+        if avg_score_train > best_score and active_neurons > 0 and consecutive_dips < 5:
             best_score = avg_score_train
             best_c = c
             best_neuron_count = active_neurons
 
+        if consecutive_dips >= 5:
+            print(f"⛔ Stopping search due to 5 consecutive ROI dips. No improvement after {best_neuron_count} neurons.")
+            break
+
+        previous_accuracy = avg_score_train
+        previous_neuron_count = active_neurons
+        previous_roi = current_roi
+
+    if best_c is None:
+        raise RuntimeError(
+            "No valid model was found under the sparsity limit. "
+            "Try a larger sparsity_limit or a smaller starting C."
+        )
+
     print("-" * 60)
-    print(f"🏆 Optimal Guardrail Found programmatically:")
+    print("🏆 Optimal Guardrail Found programmatically:")
     print(f"C: {best_c:.4f} | Accuracy: {best_score:.4f} | Neurons: {best_neuron_count}")
     print("-" * 60)
 
-    # 6. Final Definitive Fit
-    # CV returns 5 fold-specific models. We now train one final master model 
-    # on the entire dataset using the perfectly isolated C value.
     print(f"Fitting final definitive model on full dataset with C={best_c:.4f}...")
     best_model = LogisticRegression(
-        penalty=args.penalty, 
-        solver=args.solver, 
-        C=best_c, 
-        class_weight="balanced", 
-        max_iter=1000, 
+        penalty=args.penalty,
+        solver=args.solver,
+        C=best_c,
+        class_weight="balanced",
+        max_iter=10000,
         random_state=42
     )
     best_model.fit(X_train, y_train)
+
+    final_active_neurons = int(np.sum(best_model.coef_ != 0))
+    if final_active_neurons > max_allowed_neurons:
+        raise RuntimeError(
+            f"Final model violates sparsity limit after refit "
+            f"({final_active_neurons} > {max_allowed_neurons})."
+        )
 
     return best_model
 
