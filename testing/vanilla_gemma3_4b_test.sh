@@ -1,0 +1,2 @@
+# Make sure uv enviornment is activated before running!
+python -m vllm.entrypoints.openai.api_server --model /home/dzur/weights/gemma3-4b-it --tensor-parallel-size 1 --enforce-eager --max-model-len 4096 --port 8000 --gpu_memory_utilization 0.7 --attention_backend triton_attn --served-model-name gemma3-4b-it

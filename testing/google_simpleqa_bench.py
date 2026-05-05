@@ -68,7 +68,7 @@ def run_benchmark():
     }
 
     # adjust for testing
-    sample_size = 1000
+    sample_size = 20
     eval_subset = dataset.select(range(sample_size))
 
     for item in tqdm(eval_subset, desc="Evaluating"):
